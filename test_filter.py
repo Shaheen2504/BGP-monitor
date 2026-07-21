@@ -1,12 +1,17 @@
 """
-Instant sanity test for check_announcement() — no live traffic needed.
-Feeds known inputs, checks known outputs, covers all three outcomes.
-
-WHY: a detector you can only test by "waiting and hoping" is one you can't
-trust. Known-input/known-output testing is how you actually verify logic.
+Instant sanity test for check_announcement() with trie-based detection.
+No live traffic needed — known inputs, known outputs, all cases covered.
 """
 from ingest.live import check_announcement
 
-print(check_announcement("8.8.8.0/24", 15169))   # -> OK (expected origin)
-print(check_announcement("8.8.8.0/24", 64500))   # -> SUSPICIOUS (wrong origin)
-print(check_announcement("203.0.113.0/24", 123)) # -> None (not watched)
+# Legit: exact watched prefix, correct origin -> OK
+print(check_announcement("8.8.0.0/16", 15169))
+
+# Origin hijack: exact watched prefix, WRONG origin
+print(check_announcement("8.8.0.0/16", 64500))
+
+# Subprefix hijack: a /24 INSIDE our /16, wrong origin -> the sneaky one
+print(check_announcement("8.8.42.0/24", 64500))
+
+# Not ours: unrelated prefix -> None (ignored)
+print(check_announcement("9.9.9.0/24", 12345))

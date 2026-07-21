@@ -1,85 +1,94 @@
 """
-Connect to RIPE RIS Live and watch for BGP updates touching OUR prefixes.
+Connect to RIPE RIS Live and watch for BGP updates that hijack OUR prefixes.
 
 Big picture:
-    RIS Live is a firehose of BGP updates from across the Internet. We filter
-    it down to a small set of protected prefixes, so that when detection logic
-    lands, we're only reasoning about traffic that concerns us.
+    RIS Live is a firehose of global BGP updates. We filter to a set of
+    protected prefixes, then classify anything suspicious. As of Step 3 we
+    detect TWO hijack shapes:
+      - origin hijack:    someone announces our EXACT prefix with a wrong AS
+      - subprefix hijack: someone announces a MORE-SPECIFIC slice of ours
+                          (e.g. a /24 inside our /16) — steals traffic even
+                          while our own announcement is still up. Toy tools
+                          miss this; we catch it via a prefix trie.
 
-Reliability note (important):
-    A live network feed is NOT a stable thing. Connections drop, stall, and
-    time out on any network blip. A monitor that crashes on the first hiccup
-    is worthless — real monitoring must survive disconnects and come back on
-    its own. So the main loop below RECONNECTS automatically and forever.
+Reliability note:
+    Live feeds drop constantly, so the main loop reconnects forever rather
+    than crashing on the first hiccup.
 """
 import asyncio
 import json
 import websockets
 
-# Our protected prefixes and their legitimate origin AS(es).
 from config.watched_prefixes import WATCHED_PREFIXES
+from detect.trie import PrefixTrie
 
 RIS_LIVE_URL = "wss://ris-live.ripe.net/v1/ws/?client=bgp-monitor-learning"
 
-# WHY UPDATE only: it's the BGP message type that carries route
-# announcements/withdrawals — the only type that can express a hijack.
 SUBSCRIBE_MSG = {
     "type": "ris_subscribe",
     "data": {
         "type": "UPDATE",
-        "moreSpecific": True,   # also catch more-specifics (needed later
-                                # for subprefix-hijack detection)
+        "moreSpecific": True,
         "socketOptions": {"includeRaw": False},
     },
 }
 
+# Build the trie ONCE at startup from our watched list.
+# WHY at module load: the watched set doesn't change while running, so we
+# pay the build cost once instead of rebuilding per-announcement.
+TRIE = PrefixTrie()
+for _prefix, _origins in WATCHED_PREFIXES.items():
+    TRIE.insert(_prefix, _origins)
+
 
 def check_announcement(prefix, origin):
     """
-    Decide what to report for one (prefix, origin) pair.
+    Classify one (prefix, origin) announcement against our watched prefixes.
 
-    WHY a separate function:
-        The "is this interesting / suspicious?" decision lives in one place.
-        When we add real hijack scoring in Step 3, we change only here — the
-        networking code below never needs to know the rules.
+    Steps:
+      1. Ask the trie: is this prefix inside (or equal to) a watched prefix?
+         - No  -> not ours, ignore (return None). This is the 99.9% case.
+      2. If yes, we know the legit origin(s) for the containing prefix.
+         - origin is legit           -> normal (OK)
+         - origin is NOT legit, and
+             incoming == watched      -> ORIGIN HIJACK (exact prefix, wrong AS)
+             incoming more-specific   -> SUBPREFIX HIJACK (slice of ours)
 
-    Current (naive first-cut) rule:
-        - prefix not watched      -> ignore (return None)
-        - watched, right origin   -> normal
-        - watched, wrong origin   -> suspicious (right prefix, wrong announcer)
+    WHY distinguish the two hijack types:
+        They're different attacks with different severity. A subprefix hijack
+        is sneakier (your own route stays up, so naive monitoring sees
+        nothing). Labelling them separately is exactly the nuance that shows
+        you understand routing, not just string matching.
     """
-    if prefix not in WATCHED_PREFIXES:
-        return None
+    match = TRIE.search(prefix)
+    if match is None:
+        return None                       # not inside any watched prefix
 
-    expected_origins = WATCHED_PREFIXES[prefix]
+    watched_prefix, expected_origins = match
 
     if origin in expected_origins:
-        return f"OK        {prefix:<18} origin=AS{origin} (expected)"
+        return f"OK          {prefix:<18} origin=AS{origin} (expected)"
+
+    # Wrong origin for something inside our space -> a hijack. Which kind?
+    if prefix == watched_prefix:
+        kind = "ORIGIN HIJACK   "        # exact prefix announced by wrong AS
     else:
-        return (f"SUSPICIOUS {prefix:<18} origin=AS{origin} "
-                f"(expected AS{expected_origins})")
+        kind = "SUBPREFIX HIJACK"        # more-specific slice of our prefix
+
+    return (f"{kind} {prefix:<18} origin=AS{origin} "
+            f"(inside {watched_prefix}, expected AS{expected_origins})")
 
 
 async def handle_messages(ws):
-    """
-    Read messages off one live connection until it closes.
-
-    Kept separate from the connection/retry logic so each function does one
-    job: this one PARSES, the loop below CONNECTS-and-RECOVERS.
-    """
+    """Read and classify messages off one live connection until it closes."""
     async for raw in ws:
         msg = json.loads(raw)
-
-        # RIS wraps route data as "ris_message"; skip keepalives/status.
         if msg.get("type") != "ris_message":
             continue
 
         data = msg["data"]
         path = data.get("path", [])
-
-        # The origin is the LAST hop of the AS-path: the network that
-        # originally announced the prefix — i.e. the one claiming to own it.
-        origin = path[-1] if path else None
+        origin = path[-1] if path else None    # last hop = announcing AS
 
         for ann in data.get("announcements", []):
             for prefix in ann.get("prefixes", []):
@@ -89,28 +98,16 @@ async def handle_messages(ws):
 
 
 async def stream_forever():
-    """
-    Connect, subscribe, and read — and if the connection dies for ANY
-    reason, wait briefly and reconnect. This loop never gives up.
-
-    WHY ping_interval=None:
-        The default keepalive pings can false-trigger a "timeout" during
-        quiet periods and kill the connection. RIS Live sends its own
-        keepalives, so we turn the client-side ping off and instead rely on
-        reconnecting if the stream truly goes silent.
-    """
-    while True:  # reconnect loop — the heart of the resilience
+    """Connect, subscribe, read; reconnect forever on any failure."""
+    while True:
         try:
             async with websockets.connect(RIS_LIVE_URL,
                                           ping_interval=None) as ws:
                 await ws.send(json.dumps(SUBSCRIBE_MSG))
                 print("Connected. Watching", len(WATCHED_PREFIXES),
-                      "prefixes. Listening for matches...\n")
+                      "prefixes (trie loaded). Listening...\n")
                 await handle_messages(ws)
-
         except Exception as e:
-            # Any failure (timeout, drop, DNS glitch) lands here. We log it
-            # and retry rather than crashing — that's the whole point.
             print(f"[connection lost: {e}] reconnecting in 5s...")
             await asyncio.sleep(5)
 
