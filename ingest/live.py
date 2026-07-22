@@ -23,6 +23,7 @@ import websockets
 from config.watched_prefixes import WATCHED_PREFIXES
 from detect.trie import PrefixTrie
 from detect.baseline import PrefixBaseline, ConfidenceScorer
+from detect.alerts import record_alert
 
 RIS_LIVE_URL = "wss://ris-live.ripe.net/v1/ws/?client=bgp-monitor-learning"
 
@@ -126,8 +127,15 @@ def check_announcement(prefix, origin, collector=None):
     if not SCORER.should_alert(score):
         return None                       # below threshold — suppressed
 
-    kind = "SUBPREFIX HIJACK" if is_subprefix else "ORIGIN HIJACK   "
-    return (f"[score {score:>3}] {kind} {prefix:<18} origin=AS{origin} "
+    kind = "SUBPREFIX HIJACK" if is_subprefix else "ORIGIN HIJACK"
+
+    # Store structured data for the dashboard/API, in addition to the
+    # human-readable line we return for terminal output. Same event, two
+    # consumers — keeping both in one place avoids them drifting apart.
+    record_alert(prefix=prefix, origin=origin, watched_prefix=watched_prefix,
+                 score=score, reasons=reasons, kind=kind, collector=collector)
+
+    return (f"[score {score:>3}] {kind:<16} {prefix:<18} origin=AS{origin} "
             f"(inside {watched_prefix}) | " + ", ".join(reasons))
 
 
