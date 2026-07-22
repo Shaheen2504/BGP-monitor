@@ -148,8 +148,9 @@ async function refresh() {
         + '<div class="row"><span class="kind' + mid + '">' + a.kind + '</span>'
         + '<span class="score">' + a.score + '</span></div>'
         + '<div>' + a.prefix + ' announced by AS' + a.origin + '</div>'
-        + '<div class="meta">inside ' + a.watched_prefix + ' &middot; ' + a.time
-        + (a.collector ? ' &middot; ' + a.collector : '') + '</div>'
+        + '<div class="meta">inside ' + a.watched_prefix
+        + ' &middot; first seen ' + a.first_seen
+        + ' &middot; seen by ' + a.collector_count + ' collector(s)</div>'
         + '<div class="meta">' + a.reasons.join(' &middot; ') + '</div>'
         + '</div>';
     }).join('');
